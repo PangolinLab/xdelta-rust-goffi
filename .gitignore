@@ -1,0 +1,11 @@
+target/
+.idea/
+.vscode/
+Cargo.lock
+.so
+.o
+.AppImage
+.exe
+.dll
+.cdylib
+.dylib

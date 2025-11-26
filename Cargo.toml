@@ -1,0 +1,15 @@
+[package]
+name = "xdelta"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "xdelta"
+crate-type = ["cdylib"]
+
+[dependencies]
+sha2 = "0.10"
+thiserror = "1.0"
+
+[features]
+default = []
