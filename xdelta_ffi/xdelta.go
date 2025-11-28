@@ -65,43 +65,65 @@ func init() {
 	}
 }
 
-// CreatePatchFile calls the Rust library to create a patch file.
-// blockSize: 4096 typical default.
-func CreatePatchFile(oldPath, newPath, patchPath string, blockSize uint32) error {
-	cold := C.CString(oldPath)
-	cnew := C.CString(newPath)
-	cpatch := C.CString(patchPath)
-	defer C.free(unsafe.Pointer(cold))
-	defer C.free(unsafe.Pointer(cnew))
-	defer C.free(unsafe.Pointer(cpatch))
+// CreateDiffsData 从两个文件数据创建补丁数据
+// 较小的 blockSize 可以提高匹配精度，但会增加计算开销
+// 较大的 blockSize 会减少计算时间，但可能降低匹配效率
+func CreateDiffsData(oldData, newData []byte, blockSize uint32) ([]byte, error) {
+	oldPtr := (*C.uint8_t)(C.CBytes(oldData))
+	newPtr := (*C.uint8_t)(C.CBytes(newData))
+	defer C.free(unsafe.Pointer(oldPtr))
+	defer C.free(unsafe.Pointer(newPtr))
 
-	r := C.xdelta_create_patch_file(cold, cnew, cpatch, C.uint32_t(blockSize))
-	if r == 0 {
-		return nil
+	var patchPtr *C.uint8_t
+	var patchLen C.size_t
+
+	r := C.xdelta_create_patch_data(
+		oldPtr, C.size_t(len(oldData)),
+		newPtr, C.size_t(len(newData)),
+		&patchPtr, &patchLen,
+		C.uint32_t(blockSize),
+	)
+
+	if r != 0 {
+		cerr := C.xdelta_last_error()
+		if cerr != nil {
+			return nil, fmt.Errorf("xdelta error: %s", C.GoString(cerr))
+		}
+		return nil, fmt.Errorf("xdelta unknown error")
 	}
-	cerr := C.xdelta_last_error()
-	if cerr != nil {
-		return fmt.Errorf("xdelta error: %s", C.GoString(cerr))
-	}
-	return fmt.Errorf("xdelta unknown error")
+
+	defer C.xdelta_free_data(patchPtr)
+
+	patchData := C.GoBytes(unsafe.Pointer(patchPtr), C.int(patchLen))
+	return patchData, nil
 }
 
-// ApplyPatchFile applies patch (patchPath) to oldPath and writes result to outPath.
-func ApplyPatchFile(oldPath, patchPath, outPath string) error {
-	cold := C.CString(oldPath)
-	cpatch := C.CString(patchPath)
-	cout := C.CString(outPath)
-	defer C.free(unsafe.Pointer(cold))
-	defer C.free(unsafe.Pointer(cpatch))
-	defer C.free(unsafe.Pointer(cout))
+// ApplyDiffsData 将补丁应用到旧数据生成新数据
+func ApplyDiffsData(oldData, diffsData []byte) ([]byte, error) {
+	oldPtr := (*C.uint8_t)(C.CBytes(oldData))
+	patchPtr := (*C.uint8_t)(C.CBytes(diffsData))
+	defer C.free(unsafe.Pointer(oldPtr))
+	defer C.free(unsafe.Pointer(patchPtr))
 
-	r := C.xdelta_apply_patch_file(cold, cpatch, cout)
-	if r == 0 {
-		return nil
+	var newPtr *C.uint8_t
+	var newLen C.size_t
+
+	r := C.xdelta_apply_patch_data(
+		oldPtr, C.size_t(len(oldData)),
+		patchPtr, C.size_t(len(diffsData)),
+		&newPtr, &newLen,
+	)
+
+	if r != 0 {
+		cerr := C.xdelta_last_error()
+		if cerr != nil {
+			return nil, fmt.Errorf("xdelta error: %s", C.GoString(cerr))
+		}
+		return nil, fmt.Errorf("xdelta unknown error")
 	}
-	cerr := C.xdelta_last_error()
-	if cerr != nil {
-		return fmt.Errorf("xdelta error: %s", C.GoString(cerr))
-	}
-	return fmt.Errorf("xdelta unknown error")
+
+	defer C.xdelta_free_data(newPtr)
+
+	newData := C.GoBytes(unsafe.Pointer(newPtr), C.int(newLen))
+	return newData, nil
 }

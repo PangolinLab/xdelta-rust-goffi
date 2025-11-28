@@ -1,11 +1,8 @@
 // src/lib.rs
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
-use std::fs;
-use std::io::{self, Write};
+use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
-use std::path::Path;
 use thiserror::Error;
 use std::cell::RefCell;
 
@@ -19,7 +16,7 @@ fn set_last_error(err: &str) {
     });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn xdelta_last_error() -> *const c_char {
     LAST_ERROR.with(|cell| {
         cell.borrow()
@@ -31,12 +28,8 @@ pub extern "C" fn xdelta_last_error() -> *const c_char {
 
 #[derive(Error, Debug)]
 enum XDeltaError {
-    #[error("io error: {0}")]
-    Io(#[from] io::Error),
     #[error("invalid argument: {0}")]
     InvalidArg(String),
-    #[error("internal error: {0}")]
-    Internal(String),
 }
 
 /// A simple rsync-style rolling checksum (a,b) described in rsync tech report.
@@ -252,32 +245,42 @@ fn apply_patch_bytes(old: &[u8], patch: &[u8]) -> Result<Vec<u8>, XDeltaError> {
     Ok(out)
 }
 
-/// High-level helpers: read files, produce patch bytes and write to path.
-/// Return 0 on success, non-zero on error. Error string available via xdelta_last_error().
-#[no_mangle]
-pub extern "C" fn xdelta_create_patch_file(
-    old_path: *const c_char,
-    new_path: *const c_char,
-    patch_path: *const c_char,
+/// 创建补丁数据（内存版本）
+/// 成功时返回0，失败返回-1
+#[unsafe(no_mangle)]
+pub extern "C" fn xdelta_create_patch_data(
+    old_data: *const u8,
+    old_len: usize,
+    new_data: *const u8,
+    new_len: usize,
+    patch_data: *mut *mut u8,
+    patch_len: *mut usize,
     block_size: u32,
 ) -> c_int {
-    let r = (|| -> Result<(), XDeltaError> {
-        if old_path.is_null() || new_path.is_null() || patch_path.is_null() {
-            return Err(XDeltaError::InvalidArg("null path".into()));
+    let r = (|| -> Result<Vec<u8>, XDeltaError> {
+        if old_data.is_null() || new_data.is_null() || patch_data.is_null() || patch_len.is_null() {
+            return Err(XDeltaError::InvalidArg("null pointer".into()));
         }
-        let old = unsafe { CStr::from_ptr(old_path) }.to_str().map_err(|e| XDeltaError::InvalidArg(e.to_string()))?;
-        let new = unsafe { CStr::from_ptr(new_path) }.to_str().map_err(|e| XDeltaError::InvalidArg(e.to_string()))?;
-        let patch = unsafe { CStr::from_ptr(patch_path) }.to_str().map_err(|e| XDeltaError::InvalidArg(e.to_string()))?;
 
-        let old_bytes = fs::read(Path::new(old))?;
-        let new_bytes = fs::read(Path::new(new))?;
-        let ps = create_patch_bytes(&old_bytes, &new_bytes, block_size as usize)?;
-        let mut f = fs::File::create(Path::new(patch))?;
-        f.write_all(&ps)?;
-        Ok(())
+        let old_bytes = unsafe { std::slice::from_raw_parts(old_data, old_len) };
+        let new_bytes = unsafe { std::slice::from_raw_parts(new_data, new_len) };
+
+        create_patch_bytes(old_bytes, new_bytes, block_size as usize)
     })();
+
     match r {
-        Ok(_) => 0,
+        Ok(data) => {
+            unsafe {
+                *patch_len = data.len();
+                *patch_data = libc::malloc(data.len()) as *mut u8;
+                if (*patch_data).is_null() {
+                    set_last_error("failed to allocate memory");
+                    return -1;
+                }
+                std::ptr::copy_nonoverlapping(data.as_ptr(), *patch_data, data.len());
+            }
+            0
+        },
         Err(e) => {
             set_last_error(&format!("{}", e));
             -1
@@ -285,31 +288,54 @@ pub extern "C" fn xdelta_create_patch_file(
     }
 }
 
-#[no_mangle]
-pub extern "C" fn xdelta_apply_patch_file(
-    old_path: *const c_char,
-    patch_path: *const c_char,
-    out_path: *const c_char,
+/// 应用补丁数据（内存版本）
+/// 成功时返回0，失败返回-1
+#[unsafe(no_mangle)]
+pub extern "C" fn xdelta_apply_patch_data(
+    old_data: *const u8,
+    old_len: usize,
+    patch_data: *const u8,
+    patch_len: usize,
+    new_data: *mut *mut u8,
+    new_len: *mut usize,
 ) -> c_int {
-    let r = (|| -> Result<(), XDeltaError> {
-        if old_path.is_null() || patch_path.is_null() || out_path.is_null() {
-            return Err(XDeltaError::InvalidArg("null path".into()));
+    let r = (|| -> Result<Vec<u8>, XDeltaError> {
+        if old_data.is_null() || patch_data.is_null() || new_data.is_null() || new_len.is_null() {
+            return Err(XDeltaError::InvalidArg("null pointer".into()));
         }
-        let old = unsafe { CStr::from_ptr(old_path) }.to_str().map_err(|e| XDeltaError::InvalidArg(e.to_string()))?;
-        let patch = unsafe { CStr::from_ptr(patch_path) }.to_str().map_err(|e| XDeltaError::InvalidArg(e.to_string()))?;
-        let out = unsafe { CStr::from_ptr(out_path) }.to_str().map_err(|e| XDeltaError::InvalidArg(e.to_string()))?;
 
-        let old_bytes = fs::read(Path::new(old))?;
-        let patch_bytes = fs::read(Path::new(patch))?;
-        let new_bytes = apply_patch_bytes(&old_bytes, &patch_bytes)?;
-        fs::write(Path::new(out), &new_bytes)?;
-        Ok(())
+        let old_bytes = unsafe { std::slice::from_raw_parts(old_data, old_len) };
+        let patch_bytes = unsafe { std::slice::from_raw_parts(patch_data, patch_len) };
+
+        apply_patch_bytes(old_bytes, patch_bytes)
     })();
+
     match r {
-        Ok(_) => 0,
+        Ok(data) => {
+            unsafe {
+                *new_len = data.len();
+                *new_data = libc::malloc(data.len()) as *mut u8;
+                if (*new_data).is_null() {
+                    set_last_error("failed to allocate memory");
+                    return -1;
+                }
+                std::ptr::copy_nonoverlapping(data.as_ptr(), *new_data, data.len());
+            }
+            0
+        },
         Err(e) => {
             set_last_error(&format!("{}", e));
             -1
+        }
+    }
+}
+
+/// 释放通过xdelta_create_patch_data或xdelta_apply_patch_data分配的内存
+#[unsafe(no_mangle)]
+pub extern "C" fn xdelta_free_data(data: *mut u8) {
+    if !data.is_null() {
+        unsafe {
+            libc::free(data as *mut libc::c_void);
         }
     }
 }
